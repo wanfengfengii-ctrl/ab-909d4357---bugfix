@@ -229,7 +229,8 @@
 
   function fmt(n) {
     if (n === null || n === undefined) return "—";
-    return Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+    // 最多 12 位小数：固定 6 位会把 5e-10 这样的真实微小非零流量显示成 0
+    return Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 12 });
   }
 
   function edgeLabel(e) {

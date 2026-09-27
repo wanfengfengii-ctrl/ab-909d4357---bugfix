@@ -23,7 +23,9 @@ from typing import Optional
 # 检修网络节点规模通常不大，放宽递归深度以支持较长的增广链。
 sys.setrecursionlimit(100_000)
 
-EPS = 1e-9
+# 算法内部的残余容量截断阈值：必须远小于接口接受的合法微小流量
+# （如 5e-10），否则真实的微小非零流量会被当成 0 而漏算。
+EPS = 1e-12
 
 # 达标判定容差（相对）：仅吸收最大流求解的浮点舍入尾差。
 # 与 Dinic 的增广遍历阈值 EPS 严格区分：EPS 是算法内部的残余容量
@@ -296,7 +298,10 @@ def audit_validated_draft(draft: dict) -> dict:
     def _meets(value: float) -> bool:
         # 严格达标：容差仅按浮点尾差量级（相对 1e-12）吸收舍入误差，
         # 最大可导排量严格小于必须持续排出量时一律判为不达标。
-        return value + MEETS_RTOL * max(1.0, abs(required_flow)) >= required_flow
+        # 容差按当前数值量级缩放且不设单位地板：5e-10 量级的真实
+        # 缺口（甚至更小）同样必须被判出来，不得被固定绝对容差放行。
+        scale = max(abs(required_flow), abs(value))
+        return value + MEETS_RTOL * scale >= required_flow
 
     # 1) 正常网络
     normal_value, normal_cut = _solve(None)
@@ -387,6 +392,13 @@ def audit_network(
 
 
 def _num(x: float) -> float:
-    """消除浮点尾差，便于展示与复核（如 0.30000000000000004）。"""
-    r = round(float(x), 6)
+    """消除浮点尾差，便于展示与复核（如 0.30000000000000004）。
+
+    按约 12 位有效数字规整而非固定小数位：固定 6 位小数会把
+    5e-10 这样的**真实微小非零值**抹成 0，丢失审计与配流证据。
+    """
+    value = float(x)
+    if value == 0:
+        return 0.0
+    r = float(f"{value:.12g}")
     return 0.0 if r == 0 else r

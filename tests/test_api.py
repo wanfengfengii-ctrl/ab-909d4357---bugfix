@@ -187,6 +187,40 @@ def test_plan_tiny_capacity_gap_not_waived():
     assert r2.json()["passed"] is False
 
 
+# 合法微小非零流量（容量与需求均为 5e-10）必须正常审计、配流并保留证据
+def test_plan_tiny_nonzero_flow_passes_with_evidence():
+    payload = {
+        "source": "S",
+        "sink": "T",
+        "required_flow": 5e-10,
+        "nodes": [],
+        "edges": [
+            {"id": "E1", "from": "S", "to": "T", "capacity": 5e-10,
+             "maintainable": False, "cost": 1},
+        ],
+    }
+    r = client.post("/api/plan", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is True
+    assert body["audit"]["normal"]["max_flow"] == 5e-10
+    assert body["audit"]["normal"]["cut"]["capacity"] == 5e-10
+    plan = body["plans"][0]
+    assert plan["flow_value"] == 5e-10
+    assert plan["flows"][0]["flow"] == 5e-10
+    assert plan["total_cost"] == 5e-10
+
+    # /api/audit 同样保留微小非零证据
+    audit_payload = {k: v for k, v in payload.items() if k != "edges"}
+    audit_payload["edges"] = [
+        {k: v for k, v in e.items() if k != "cost"} for e in payload["edges"]
+    ]
+    r2 = client.post("/api/audit", json=audit_payload)
+    assert r2.status_code == 200
+    assert r2.json()["passed"] is True
+    assert r2.json()["normal"]["max_flow"] == 5e-10
+
+
 def test_plan_missing_cost_400():
     r = client.post("/api/plan", json=PASS_PAYLOAD)  # 审计载荷没有 cost
     assert r.status_code == 400

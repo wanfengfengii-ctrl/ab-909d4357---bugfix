@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 from .flow import (
     EPS,
+    MEETS_RTOL,
     Dinic,
     NetworkValidationError,
     _num,
@@ -255,7 +256,10 @@ def _solve_plan(draft: dict, removed_index: int | None) -> dict:
         plan_edges.append((e["index"], _PlanEdge(u, v, e["capacity"], e["cost"], fwd_idx)))
 
     flow, _, potential = mcf.min_cost_flow(index_of[source], index_of[sink], required)
-    if flow + 1e-6 < required:  # 审计已放行时不可达（最大流 ≥ 要求）
+    # 审计已放行时不可达（最大流 ≥ 要求）。容差按量级缩放且不设
+    # 单位地板，5e-10 量级的微小配流不可被固定绝对容差误判。
+    shortfall_tol = MEETS_RTOL * max(abs(required), abs(flow))
+    if flow + shortfall_tol < required:
         raise RuntimeError("残余网络无法输送事故必须持续排出量，与审计结论不一致")
 
     # 总代价并列时按录入顺序取流量序列字典序最小者

@@ -115,6 +115,42 @@ def test_exact_requirement_still_passes():
     assert all(s["meets"] for s in r["scenarios"])
 
 
+def test_tiny_nonzero_flow_passes_and_keeps_nonzero_evidence():
+    """合法微小管段（容量与需求均为 5e-10）必须放行且全程保留非零证据。
+
+    回归：算法内部截断阈值曾为 1e-9，把 5e-10 的真实非零容量当作 0，
+    正常网络最大流被错误算成 0；展示层固定保留 6 位小数又把 5e-10
+    抹成 0.0，导致审计错误拒绝且看不到微小非零流量证据。
+    """
+    edges = [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 5e-10, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=[], edges=edges, required_flow=5e-10)
+    assert r["passed"] is True
+    assert r["normal"]["meets"] is True
+    assert r["normal"]["max_flow"] == 5e-10
+    assert r["failure"] is None
+    cut = r["normal"]["cut"]
+    assert cut["capacity"] == 5e-10
+    assert len(cut["cut_edges"]) == 1
+    assert cut["cut_edges"][0]["capacity"] == 5e-10
+    assert cut["source_side_nodes"] == ["S"]
+    assert cut["sink_side_nodes"] == ["T"]
+
+
+def test_tiny_real_gap_at_small_scale_is_not_waived():
+    """5e-10 量级上的真实缺口同样不得放行（容差按量级缩放，无单位地板）。"""
+    edges = [
+        {"id": "E1", "from": "S", "to": "T", "capacity": 5e-10, "maintainable": False},
+    ]
+    r = audit_network(source="S", sink="T", nodes=[], edges=edges,
+                      required_flow=5.0001e-10)
+    assert r["passed"] is False
+    assert r["failure"]["stage"] == "normal"
+    assert r["failure"]["max_flow"] == 5e-10
+    assert r["failure"]["cut"]["capacity"] == 5e-10
+
+
 def test_meets_tolerance_only_absorbs_float_rounding():
     """达标容差只吸收浮点舍入尾差（约 1e-16 量级），不放宽真实缺口。"""
     edges = [

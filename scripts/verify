@@ -8,7 +8,8 @@
   3. 导排 API 冒烟：真实拉起 uvicorn，调用 /health、/api/audit 与
      /api/plan，覆盖达标放行、失效证据（首条失效管段 + 最小割）、
      低暴露配流（各情形流量/总代价/情形编号、被移除管段零流量）、
-     微小容量缺口（5e-10，小于算法容差）不得放行、非法输入 400。
+     微小容量缺口（5e-10，小于算法容差）不得放行、合法微小非零
+     流量（容量/需求 5e-10）必须放行并保留非零证据、非法输入 400。
 """
 from __future__ import annotations
 
@@ -115,6 +116,29 @@ PAYLOAD_MICRO_GAP_AUDIT = {
     ]
     if k == "edges" else v
     for k, v in PAYLOAD_MICRO_GAP_PLAN.items()
+}
+
+# 合法微小非零流量：单管段 S→T，容量与必须持续排出量均为 5e-10
+# （小于旧的 1e-9 截断阈值），网络存在唯一可行配流；审计必须放行，
+# 最大流 / 割集容量 / 管段流量 / 总代价都必须保留 5e-10 这一非零值。
+TINY = 5e-10
+PAYLOAD_TINY_PLAN = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": TINY,
+    "nodes": [],
+    "edges": [
+        {"id": "E1", "from": "S", "to": "T", "capacity": TINY,
+         "maintainable": False, "cost": 1},
+    ],
+}
+PAYLOAD_TINY_AUDIT = {
+    k: [
+        {ek: ev for ek, ev in e.items() if ek != "cost"}
+        for e in PAYLOAD_TINY_PLAN["edges"]
+    ]
+    if k == "edges" else v
+    for k, v in PAYLOAD_TINY_PLAN.items()
 }
 
 
@@ -338,6 +362,37 @@ def run_smoke() -> bool:
         bad_cost_ok = status == 400 and "非负整数" in body.get("error", "")
         _log(bad_cost_ok, f"非整数单位暴露代价返回 400（实际 HTTP {status}：{body.get('error', '')}）")
         ok &= bad_cost_ok
+
+        # 合法微小非零流量（容量/需求 5e-10）：审计放行，证据全部保留非零值
+        status, body = _request("POST", f"{base}/api/audit", PAYLOAD_TINY_AUDIT)
+        normal = body.get("normal") or {}
+        tiny_audit_ok = (
+            status == 200
+            and body.get("passed") is True
+            and normal.get("max_flow") == TINY
+            and normal.get("cut", {}).get("capacity") == TINY
+            and normal.get("cut", {}).get("cut_edges", [{}])[0].get("capacity") == TINY
+        )
+        _log(tiny_audit_ok, "微小非零流量（5e-10）审计放行且最大流/割集容量保留非零值",
+             "" if tiny_audit_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= tiny_audit_ok
+
+        status, body = _request("POST", f"{base}/api/plan", PAYLOAD_TINY_PLAN)
+        plans = body.get("plans") or []
+        tiny_plan_ok = (
+            status == 200
+            and body.get("passed") is True
+            and body.get("audit", {}).get("normal", {}).get("max_flow") == TINY
+            and len(plans) == 1  # 不可检修单管段：只有正常情形
+            and plans[0].get("flow_value") == TINY
+            and plans[0].get("total_cost") == TINY
+            and plans[0]["flows"][0].get("flow") == TINY
+            and plans[0]["flows"][0].get("exposure") == TINY
+            and plans[0]["flows"][0].get("removed") is False
+        )
+        _log(tiny_plan_ok, "微小非零流量（5e-10）生成唯一配流单（流量/总代价/割集均为非零值）",
+             "" if tiny_plan_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= tiny_plan_ok
     finally:
         server.terminate()
         try:
