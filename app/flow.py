@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import math
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -23,14 +24,31 @@ from typing import Optional
 # 检修网络节点规模通常不大，放宽递归深度以支持较长的增广链。
 sys.setrecursionlimit(100_000)
 
-EPS = 1e-9
+# 残余容量截断的**相对**容差：仅吸收浮点舍入尾差。
+#
+# 不能使用绝对阈值（历史上的 EPS=1e-9）：流量整体量级小于该阈值时
+# （如容量与排出量均为 5e-10 的合法微小管段），真实残余容量会被
+# 当成 0 截断，最大流、最小割与配流全部被错误抹零。实际阈值按求解
+# 规模（需求与容量的最大值，见 ``residual_tolerance``）缩放：
+# 规模 100 时约 1e-10，规模 5e-10 时约 5e-22——任何真实缺口
+# （哪怕只有 5e-10）都仍远大于容差，不会被放行。
+RESIDUAL_RTOL = 1e-12
 
 # 达标判定容差（相对）：仅吸收最大流求解的浮点舍入尾差。
-# 与 Dinic 的增广遍历阈值 EPS 严格区分：EPS 是算法内部的残余容量
+# 与残余容量截断 RESIDUAL_RTOL 严格区分：后者是算法内部的残余容量
 # 截断，而本容差用于“最大可导排量是否达到必须持续排出量”的业务
 # 判定。任何真实容量缺口——哪怕只有 5e-10——都必须判为不达标，
 # 不得被容差放行。
 MEETS_RTOL = 1e-12
+
+
+def residual_tolerance(scale: float) -> float:
+    """当前流量规模下的残余容量截断阈值（相对容差）。
+
+    规模取网络容量 / 需求的量级（调用方保证为正），因此 5e-10 的
+    微小网络阈值约为 5e-22，绝不会把真实非零流量截断为 0。
+    """
+    return RESIDUAL_RTOL * abs(float(scale))
 
 
 class NetworkValidationError(ValueError):
@@ -49,19 +67,32 @@ class _Edge:
     to: int
     rev: int
     cap: float
+    # 配对正/反向边共享流量盒：不通过“原容量 − 残余容量”回读已推送
+    # 流量——容量远大于推送量时浮点相减会把真实微小流量抹成 0。
+    flowbox: list
+    sign: int
 
 
 class Dinic:
-    """容量为非负实数的有向图 Dinic 最大流。"""
+    """容量为非负实数的有向图 Dinic 最大流。
 
-    def __init__(self, n: int):
+    ``tol`` 为残余容量截断阈值，按求解规模由调用方通过
+    :func:`residual_tolerance` 计算，避免用固定绝对阈值抹掉
+    量级很小的真实流量。
+    """
+
+    def __init__(self, n: int, tol: float = RESIDUAL_RTOL):
         self.n = n
+        self.tol = tol
         self.g: list[list[_Edge]] = [[] for _ in range(n)]
 
     def add_edge(self, u: int, v: int, cap: float) -> int:
         """添加有向边，返回正向边在 ``g[u]`` 中的下标（便于回读实际流量）。"""
-        fwd = _Edge(to=v, rev=len(self.g[v]), cap=float(cap))
-        bak = _Edge(to=u, rev=len(self.g[u]), cap=0.0)
+        flowbox = [0.0]
+        fwd = _Edge(to=v, rev=len(self.g[v]), cap=float(cap),
+                    flowbox=flowbox, sign=1)
+        bak = _Edge(to=u, rev=len(self.g[u]), cap=0.0,
+                    flowbox=flowbox, sign=-1)
         self.g[u].append(fwd)
         self.g[v].append(bak)
         return len(self.g[u]) - 1
@@ -73,7 +104,7 @@ class Dinic:
         while q:
             u = q.popleft()
             for e in self.g[u]:
-                if e.cap > EPS and level[e.to] < 0:
+                if e.cap > self.tol and level[e.to] < 0:
                     level[e.to] = level[u] + 1
                     q.append(e.to)
         return level
@@ -83,11 +114,12 @@ class Dinic:
             return pushed
         while it[u] < len(self.g[u]):
             e = self.g[u][it[u]]
-            if e.cap > EPS and level[e.to] == level[u] + 1:
+            if e.cap > self.tol and level[e.to] == level[u] + 1:
                 got = self._dfs(e.to, t, min(pushed, e.cap), level, it)
-                if got > EPS:
+                if got > self.tol:
                     e.cap -= got
                     self.g[e.to][e.rev].cap += got
+                    e.flowbox[0] += e.sign * got
                     return got
             it[u] += 1
         return 0.0
@@ -96,14 +128,14 @@ class Dinic:
         """求 s→t 最大流；给定 ``limit`` 时流量达到该上限即提前停止。"""
         flow = 0.0
         inf = float("inf")
-        while flow < limit - EPS:
+        while flow < limit - self.tol:
             level = self._bfs(s, t)
             if level[t] < 0:
                 return flow
             it = [0] * self.n
-            while flow < limit - EPS:
+            while flow < limit - self.tol:
                 pushed = self._dfs(s, t, min(inf, limit - flow), level, it)
-                if pushed <= EPS:
+                if pushed <= self.tol:
                     break
                 flow += pushed
         return flow
@@ -116,7 +148,7 @@ class Dinic:
         while q:
             u = q.popleft()
             for e in self.g[u]:
-                if e.cap > EPS and not seen[e.to]:
+                if e.cap > self.tol and not seen[e.to]:
                     seen[e.to] = True
                     q.append(e.to)
         return seen
@@ -132,8 +164,6 @@ def _clean_name(raw, field: str) -> str:
 
 
 def _finite_positive_number(raw, field: str) -> float:
-    import math
-
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         raise NetworkValidationError(f"{field} 必须是正数", field)
     value = float(raw)
@@ -163,8 +193,6 @@ def _validate_draft(
         {"id": "E1" | None, "from": "S", "to": "T",
          "capacity": 100.0, "maintainable": True}
     """
-    import math
-
     source = _clean_name(source, "泄压源")
     sink = _clean_name(sink, "安全焚烧端")
     if source == sink:
@@ -259,13 +287,14 @@ def audit_validated_draft(draft: dict) -> dict:
 
     def _solve(removed_index: Optional[int]) -> tuple[float, dict]:
         """在一张**全新**的网络上独立求最大流，并返回流量与最小割证据。"""
-        dinic = Dinic(len(all_nodes))
-        active = []
-        for e in clean_edges:
-            if e["index"] == removed_index:
-                continue
+        active = [e for e in clean_edges if e["index"] != removed_index]
+        # 截断阈值按当前网络的流量规模（需求与容量的最大量级）缩放，
+        # 使 5e-10 这类合法微小网络的真实残余容量不会被绝对阈值抹掉。
+        scale = max([required_flow] + [e["capacity"] for e in active])
+        tol = residual_tolerance(scale)
+        dinic = Dinic(len(all_nodes), tol)
+        for e in active:
             dinic.add_edge(index_of[e["from"]], index_of[e["to"]], e["capacity"])
-            active.append(e)
         value = dinic.max_flow(index_of[source], index_of[sink])
         side = dinic.reachable_from_source(index_of[source])
 
@@ -387,6 +416,21 @@ def audit_network(
 
 
 def _num(x: float) -> float:
-    """消除浮点尾差，便于展示与复核（如 0.30000000000000004）。"""
-    r = round(float(x), 6)
+    """消除浮点尾差，便于展示与复核（如 0.30000000000000004）。
+
+    按**有效数字**（而非固定小数位）规整：固定 ``round(x, 6)`` 会把
+    5e-10 这类合法微小非零值抹成 0。对小于 1e-6 的值按相对量级取
+    有效数字，使其保留真实非零值的同时仍能消去浮点尾差。
+    """
+    x = float(x)
+    if x == 0.0:
+        return 0.0
+    magnitude = math.floor(math.log10(abs(x)))
+    # 常规量级仍按 6 位小数规整（保持既有展示语义）；微小量级改为
+    # 保留 12 位有效数字（如 5e-10、100.0000000005 一类数值）。
+    if magnitude >= -6:
+        ndigits = 6
+    else:
+        ndigits = 12 - 1 - magnitude
+    r = round(x, ndigits)
     return 0.0 if r == 0 else r

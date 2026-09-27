@@ -34,12 +34,12 @@ import math
 from dataclasses import dataclass
 
 from .flow import (
-    EPS,
     Dinic,
     NetworkValidationError,
     _num,
     _validate_draft,
     audit_validated_draft,
+    residual_tolerance,
 )
 
 
@@ -51,6 +51,12 @@ class _MCFEdge:
     rev: int
     cap: float
     cost: int
+    # 配对正/反向边共享同一个流量盒：正向弧推送 +δ、反向弧回退 −δ。
+    # 不使用“原容量 − 残余容量”回读流量——管段容量远大于实际流量时
+    # （如容量 1e20 而只输送 5e-10），浮点相减会因灾难性舍入把真实
+    # 微小流量抹成 0。sign 区分正向弧 (+1) 与反向弧 (−1)。
+    flowbox: list
+    sign: int
 
 
 class MinCostFlow:
@@ -60,14 +66,20 @@ class MinCostFlow:
     比较与累加精确无误差。
     """
 
-    def __init__(self, n: int):
+    def __init__(self, n: int, tol: float = 1e-12):
         self.n = n
+        # 残余容量截断阈值，按求解规模缩放（避免抹掉 5e-10 量级的
+        # 真实非零流量）；与费用无关，费用恒为整数。
+        self.tol = tol
         self.g: list[list[_MCFEdge]] = [[] for _ in range(n)]
 
     def add_edge(self, u: int, v: int, cap: float, cost: int) -> int:
         """添加有向边，返回正向边在 ``g[u]`` 中的下标（便于回读流量）。"""
-        fwd = _MCFEdge(to=v, rev=len(self.g[v]), cap=float(cap), cost=int(cost))
-        bak = _MCFEdge(to=u, rev=len(self.g[u]), cap=0.0, cost=-int(cost))
+        flowbox = [0.0]
+        fwd = _MCFEdge(to=v, rev=len(self.g[v]), cap=float(cap), cost=int(cost),
+                       flowbox=flowbox, sign=1)
+        bak = _MCFEdge(to=u, rev=len(self.g[u]), cap=0.0, cost=-int(cost),
+                       flowbox=flowbox, sign=-1)
         self.g[u].append(fwd)
         self.g[v].append(bak)
         return len(self.g[u]) - 1
@@ -85,7 +97,7 @@ class MinCostFlow:
         flow = 0.0
         total_cost = 0.0
         inf = float("inf")
-        while flow < amount - EPS:
+        while flow < amount - self.tol:
             # Dijkstra（约化费用非负，由势量保证）
             dist = [inf] * n
             dist[s] = 0
@@ -97,7 +109,7 @@ class MinCostFlow:
                 if d > dist[u]:
                     continue
                 for ei, e in enumerate(self.g[u]):
-                    if e.cap <= EPS:
+                    if e.cap <= self.tol:
                         continue
                     nd = d + e.cost + potential[u] - potential[e.to]
                     if nd < dist[e.to]:
@@ -123,6 +135,7 @@ class MinCostFlow:
                 e = self.g[prev_node[v]][prev_edge[v]]
                 e.cap -= push
                 self.g[v][e.rev].cap += push
+                e.flowbox[0] += e.sign * push
                 path_cost += e.cost
                 v = prev_node[v]
             flow += push
@@ -142,11 +155,12 @@ class _PlanEdge:
 
 
 def _flow_of(mcf: MinCostFlow, pe: _PlanEdge) -> float:
-    return pe.cap - mcf.g[pe.u][pe.fwd_idx].cap
+    # 直接读取累计流量，不用原容量减残余容量（避免大小量级相减抹零）。
+    return mcf.g[pe.u][pe.fwd_idx].flowbox[0]
 
 
 def _lexicographic_minimize(
-    mcf: MinCostFlow, plan_edges: list[_PlanEdge], potential: list[int]
+    mcf: MinCostFlow, plan_edges: list[_PlanEdge], potential: list[int], tol: float = 1e-12
 ) -> None:
     """在保持总代价不变的前提下，按列表顺序逐条把流量压到字典序最小。
 
@@ -158,7 +172,7 @@ def _lexicographic_minimize(
     locked: set[int] = set()
     for i, pe in enumerate(plan_edges):
         current = _flow_of(mcf, pe)
-        if current <= EPS:
+        if current <= tol:
             locked.add(i)
             continue
         fwd_i = mcf.g[pe.u][pe.fwd_idx]
@@ -170,28 +184,30 @@ def _lexicographic_minimize(
             locked.add(i)
             continue
         # 零约化费用残余图（排除已锁定管段与本管段）
-        dinic = Dinic(mcf.n)
-        arcs: list[tuple[int, bool, int, int, float]] = []
+        dinic = Dinic(mcf.n, tol)
+        arcs: list[tuple[int, bool, int, int]] = []
         for j, qe in enumerate(plan_edges):
             if j == i or j in locked:
                 continue
             fwd = mcf.g[qe.u][qe.fwd_idx]
             bak = mcf.g[qe.v][fwd.rev]
             # 正向残余弧（该管段流量可增）
-            if fwd.cap > EPS and fwd.cost + potential[qe.u] - potential[qe.v] == 0:
+            if fwd.cap > tol and fwd.cost + potential[qe.u] - potential[qe.v] == 0:
                 idx = dinic.add_edge(qe.u, qe.v, fwd.cap)
-                arcs.append((j, True, qe.u, idx, fwd.cap))
+                arcs.append((j, True, qe.u, idx))
             # 反向残余弧（该管段流量可减）
-            if bak.cap > EPS and bak.cost + potential[qe.v] - potential[qe.u] == 0:
+            if bak.cap > tol and bak.cost + potential[qe.v] - potential[qe.u] == 0:
                 idx = dinic.add_edge(qe.v, qe.u, bak.cap)
-                arcs.append((j, False, qe.v, idx, bak.cap))
+                arcs.append((j, False, qe.v, idx))
         # 最多把本管段当前流量全部改推出去
         moved = dinic.max_flow(pe.u, pe.v, limit=current)
-        if moved > EPS:
-            # 把 Dinic 实际推送的流量折算回真实残余网络
-            for j, is_fwd, au, aidx, acap in arcs:
-                used = acap - dinic.g[au][aidx].cap
-                if used <= EPS:
+        if moved > tol:
+            # 把 Dinic 实际推送的流量折算回真实残余网络。
+            # used 直接取复制弧的累计流量，不用容量相减（同样为避免
+            # 大残余容量 − 小推送量时的灾难性舍入）。
+            for j, is_fwd, au, aidx in arcs:
+                used = dinic.g[au][aidx].flowbox[0]
+                if abs(used) <= tol:
                     continue
                 qe = plan_edges[j]
                 fwd = mcf.g[qe.u][qe.fwd_idx]
@@ -199,14 +215,17 @@ def _lexicographic_minimize(
                 if is_fwd:
                     fwd.cap -= used
                     bak.cap += used
+                    fwd.flowbox[0] += used
                 else:
                     bak.cap -= used
                     fwd.cap += used
+                    fwd.flowbox[0] -= used
             # 本管段流量减少 moved（正向残余增大、反向残余减小）
             fwd_i = mcf.g[pe.u][pe.fwd_idx]
             bak_i = mcf.g[pe.v][fwd_i.rev]
             fwd_i.cap += moved
             bak_i.cap -= moved
+            fwd_i.flowbox[0] -= moved
         locked.add(i)
 
 
@@ -245,21 +264,26 @@ def _solve_plan(draft: dict, removed_index: int | None) -> dict:
     sink = draft["sink"]
     required = draft["required_flow"]
 
-    mcf = MinCostFlow(len(all_nodes))
+    active_edges = [e for e in draft["edges"] if e["index"] != removed_index]
+    # 截断阈值按本情形实际输送量（= 必须持续排出量）缩放：最小费用流
+    # 只会推送恰好 required 的流量，故不能用最大管段容量作规模——
+    # 否则一条超大容量管段会把截断阈值抬高到小排出量之上，直接跳过
+    # 求解，把 5e-10 这类真实流量抹掉。
+    tol = residual_tolerance(required)
+
+    mcf = MinCostFlow(len(all_nodes), tol)
     plan_edges: list[tuple[int, _PlanEdge]] = []  # (管段录入下标, 内部引用)
-    for e in draft["edges"]:
-        if e["index"] == removed_index:
-            continue  # 被移除管段不进入残余网络，流量固定为零
+    for e in active_edges:
         u, v = index_of[e["from"]], index_of[e["to"]]
         fwd_idx = mcf.add_edge(u, v, e["capacity"], e["cost"])
         plan_edges.append((e["index"], _PlanEdge(u, v, e["capacity"], e["cost"], fwd_idx)))
 
     flow, _, potential = mcf.min_cost_flow(index_of[source], index_of[sink], required)
-    if flow + 1e-6 < required:  # 审计已放行时不可达（最大流 ≥ 要求）
+    if flow + tol < required:  # 审计已放行时不可达（最大流 ≥ 要求）
         raise RuntimeError("残余网络无法输送事故必须持续排出量，与审计结论不一致")
 
     # 总代价并列时按录入顺序取流量序列字典序最小者
-    _lexicographic_minimize(mcf, [pe for _, pe in plan_edges], potential)
+    _lexicographic_minimize(mcf, [pe for _, pe in plan_edges], potential, tol)
 
     flow_of: dict[int, float] = {
         idx: _flow_of(mcf, pe) for idx, pe in plan_edges
@@ -269,7 +293,7 @@ def _solve_plan(draft: dict, removed_index: int | None) -> dict:
     for e in draft["edges"]:
         removed = e["index"] == removed_index
         f = 0.0 if removed else flow_of[e["index"]]
-        if abs(f) < EPS:
+        if abs(f) < tol:
             f = 0.0
         total_cost += f * e["cost"]
         flows.append(

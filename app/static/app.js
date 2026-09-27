@@ -229,7 +229,14 @@
 
   function fmt(n) {
     if (n === null || n === undefined) return "—";
-    return Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+    const x = Number(n);
+    if (x === 0) return "0";
+    // 常规量级保留至多 6 位小数；微小非零值（< 1e-6）按 12 位有效
+    // 数字补足小数位，避免把 5e-10 这类真实流量显示成 0。
+    const magnitude = Math.floor(Math.log10(Math.abs(x)));
+    // toLocaleString 的 maximumFractionDigits 上限为 20。
+    const maxFrac = Math.min(20, magnitude >= -6 ? 6 : 12 - 1 - magnitude);
+    return x.toLocaleString("zh-CN", { maximumFractionDigits: maxFrac });
   }
 
   function edgeLabel(e) {

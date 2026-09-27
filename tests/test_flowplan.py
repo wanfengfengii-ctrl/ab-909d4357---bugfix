@@ -281,6 +281,54 @@ def test_boolean_cost_rejected():
         )
 
 
+def test_tiny_legitimate_flow_generates_unique_plan():
+    """合法微小管段（容量 / 需求均为 5e-10）通过审计并生成唯一配流。
+
+    回归：绝对截断阈值曾把 5e-10 的真实流量抹成 0，审计误判不达标、
+    plans=null。现总流量、该管段流量与总代价均应为 5e-10。
+    """
+    kw = {
+        "source": "S", "sink": "T", "required_flow": 5e-10, "nodes": [],
+        "edges": [
+            {"id": "E1", "from": "S", "to": "T", "capacity": 5e-10,
+             "maintainable": False, "cost": 1},
+        ],
+    }
+    r = plan_low_exposure(**kw)
+    assert r["passed"] is True
+    assert r["plans"] is not None
+    assert len(r["plans"]) == 1
+    plan = r["plans"][0]
+    assert plan["scenario"] == 0 and plan["removed"] is None
+    assert plan["flow_value"] == 5e-10
+    assert plan["total_cost"] == 5e-10
+    edge = plan["flows"][0]
+    assert edge["flow"] == 5e-10
+    assert edge["exposure"] == 5e-10
+    assert edge["capacity"] == 5e-10
+    assert edge["removed"] is False
+    # 内嵌审计同样保留非零最大流 / 割集容量
+    audit = r["audit"]
+    assert audit["normal"]["max_flow"] == 5e-10
+    assert audit["normal"]["cut"]["capacity"] == 5e-10
+
+
+def test_tiny_flow_not_zeroed_even_beside_huge_capacity():
+    """小排出量不会因网络中存在超大容量管段而被截断阈值抹零。"""
+    kw = {
+        "source": "S", "sink": "T", "required_flow": 5e-10, "nodes": [],
+        "edges": [
+            {"id": "E1", "from": "S", "to": "T", "capacity": 1e20,
+             "maintainable": False, "cost": 1},
+        ],
+    }
+    r = plan_low_exposure(**kw)
+    assert r["passed"] is True
+    assert r["plans"][0]["flow_value"] == 5e-10
+    assert r["plans"][0]["flows"][0]["flow"] == 5e-10
+    assert r["plans"][0]["total_cost"] == 5e-10
+
+
 def test_integer_valued_float_cost_accepted():
     r = plan_low_exposure(
         source="S", sink="T", nodes=[],
